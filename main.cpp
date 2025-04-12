@@ -4,13 +4,25 @@
 #include <unistd.h>
 #include <linux/input.h>
 #include <portaudio.h>
+#include <vector>
+#include <algorithm>
+#include <map>
+
 const int SAMPLE_RATE = 44100;
 
 typedef struct {
     float phase;
     float amplitude;
-    float frequency;
     bool  is_playing;
+    float frequency;
+}
+note;
+
+typedef struct {
+    std::vector<note> notes;
+    float amplitude;
+    std::map<int, int> key_to_note;
+    int waveform;
 }
 pa_data;
 
@@ -20,6 +32,29 @@ static int call_back(const void *input_buffer, void *output_buffer,
                      PaStreamCallbackFlags status_flags, void *synth_data);
 
 void play(const char* device_path);
+
+int get_note(pa_data *data);
+
+float generate_waveform(float phase, int waveform) {
+    float normalizedPhase = phase / (2.0f * M_PI);
+    switch (waveform) {
+        case 0: // sine
+            return sin(phase);
+        case 1: // sawthooth
+            return (normalizedPhase * 2.0f) - 1.0f;
+        case 2: { // square
+            float value = 0.0f;
+            for (int k = 1; k <= 7; k += 2) {
+                value += sin(k * phase) / k;
+            }
+            return (4.0f / M_PI) * value;
+        }
+        case 3:
+            return 2.0f * fabs(2.0f * normalizedPhase - 1.0f) - 1.0f;
+        default:
+            return sin(phase);
+    }
+}
 
 int main() {
     play("/dev/input/event3");
@@ -32,23 +67,40 @@ static int call_back(const void *input_buffer, void *output_buffer, unsigned lon
     float *out = (float*)output_buffer;
     (void) input_buffer;
 
-
     for (unsigned long i = 0; i < frames_per_buffer; i++) {
-        if (data->is_playing) {
-            float value = data->amplitude * sin(data->phase);
-            float square = 0.0f;
-            if (value > 0) square = 1.0f;
-            else square = -1.0f;
-            float saw = (data->phase / (M_PI)) - 1.0f;
-            *out++ = saw;
-            data->phase += (data->frequency * 2.0f * M_PI) / SAMPLE_RATE;
-            if (data->phase >= 2.0f * M_PI)
-                data->phase -= 2.0f * M_PI;
-        } else {
-            *out++ = 0.0f;
+        float sound = 0.0f;
+        int active_notes = 0;
+
+        for (size_t j = 0; j < data->notes.size(); j++) {
+            float waveform_in_moment = generate_waveform(data->notes[j].phase, data->waveform);
+            if (data->notes[j].is_playing) {
+                sound += waveform_in_moment;
+                active_notes++;
+            }
+
+            data->notes[j].phase += (data->notes[j].frequency * 2.0f * M_PI) / SAMPLE_RATE;
+            if (data->notes[j].phase >= 2.0f * M_PI)
+                data->notes[j].phase -= 2.0f * M_PI;
         }
+
+        if (active_notes > 0) {
+            sound = sound * data->amplitude / active_notes;
+        }
+
+        *out++ = sound;
     }
     return paContinue;
+}
+
+int get_note(pa_data *data) {
+    for (size_t i = 0; i < data->notes.size(); i++) {
+        if (!data->notes[i].is_playing) {
+            return i;
+        }
+    }
+
+    data->notes.push_back({0.0f, 0.0f, false});
+    return data->notes.size() - 1;
 }
 
 void play(const char* device_path) {
@@ -56,9 +108,7 @@ void play(const char* device_path) {
     PaStream *stream;
     pa_data data;
     data.amplitude  = 0.5f;
-    data.is_playing = false;
-    data.phase      = 0.0f;
-    data.frequency  = 440.0f;
+    data.waveform   = 2;
 
     int fd = open(device_path, O_RDONLY);
     if (fd == -1) {
@@ -87,6 +137,28 @@ void play(const char* device_path) {
         return;
     }
 
+    std::map<int, float> key_frequencies = {
+        {KEY_Q, 523.25f}, // C
+        {KEY_2, 554.37f}, // C#
+        {KEY_W, 587.33f}, // D
+        {KEY_3, 622.25f}, // D#
+        {KEY_E, 659.25f}, // E
+        {KEY_R, 698.46f}, // F
+        {KEY_5, 739.99f}, // F#
+        {KEY_T, 783.99f},  // G
+        {KEY_6, 830.61f},  // G#
+        {KEY_Y, 880.0f},  // A
+        {KEY_7, 932.33f}, // A#
+        {KEY_U, 987.77f}, // B
+        {KEY_I, 1046.50f}, // C6
+        {KEY_9, 1108.73f}, // C#6
+        {KEY_O, 1174.66f}, // D6
+        {KEY_0, 1244.51f}, // D#6
+        {KEY_P, 1318.51f}, // E6
+        {KEY_LEFTBRACE, 1396.91f}, // F6
+        {KEY_EQUAL, 1479.98f}      // F#6
+    };
+
     input_event event;
     bool playing = true;
 
@@ -94,112 +166,28 @@ void play(const char* device_path) {
         ssize_t n = read(fd, &event, sizeof(event));
         if (n == sizeof(event)) {
             if (event.type == EV_KEY) {
-                if (event.code == KEY_Q) {
+                auto freq_it = key_frequencies.find(event.code);
+                if (freq_it != key_frequencies.end()) {
                     if (event.value == 1) {
-                        data.frequency  = 523.25f; // C
-                        data.is_playing = true;
+                        int note_idx = get_note(&data);
+                        data.notes[note_idx].frequency = freq_it->second;
+                        data.notes[note_idx].is_playing = true;
+                        data.key_to_note[event.code] = note_idx;
                     } else if (event.value == 0) {
-                        data.is_playing = false;
+                        auto note_it = data.key_to_note.find(event.code);
+                        if (note_it != data.key_to_note.end()) {
+                            data.notes[note_it->second].is_playing = false;
+                            data.key_to_note.erase(note_it);
+                        }
                     }
+                } else if (event.code == KEY_Z && event.value == 1) {
+                    playing = false;
                 }
-                if (event.code == KEY_2) {
-                    if (event.value == 1) {
-                        data.frequency  = 277.18;  // C#
-                        data.is_playing = true;
-                    } else if (event.value == 0) {
-                        data.is_playing = false;
-                    }
-                }
-                if (event.code == KEY_W) {
-                    if (event.value == 1) {
-                        data.frequency  = 293.66f; // D
-                        data.is_playing = true;
-                    } else if (event.value == 0) {
-                        data.is_playing = false;
-                    }
-                }
-                if (event.code == KEY_3) {
-                    if (event.value == 1) {
-                        data.frequency  = 311.13f;  // D#
-                        data.is_playing = true;
-                    } else if (event.value == 0) {
-                        data.is_playing = false;
-                    }
-                }
-                if (event.code == KEY_E) {
-                    if (event.value == 1) {
-                        data.frequency  = 329.63f; // E
-                        data.is_playing = true;
-                    } else if (event.value == 0) {
-                        data.is_playing = false;
-                    }
-                }
-                if (event.code == KEY_R) {
-                    if (event.value == 1) {
-                        data.frequency  = 349.23f; // F
-                        data.is_playing = true;
-                    } else if (event.value == 0) {
-                        data.is_playing = false;
-                    }
-                }
-                if (event.code == KEY_5) {
-                    if (event.value == 1) {
-                        data.frequency  = 369.99f; // F#
-                        data.is_playing = true;
-                    } else if (event.value == 0) {
-                        data.is_playing = false;
-                    }
-                }
-                if (event.code == KEY_T) {
-                    if (event.value == 1) {
-                        data.frequency  = 392.0f; // G
-                        data.is_playing = true;
-                    } else if (event.value == 0) {
-                        data.is_playing = false;
-                    }
-                }
-                if (event.code == KEY_6) {
-                    if (event.value == 1) {
-                        data.frequency  = 415.3f; // G#
-                        data.is_playing = true;
-                    } else if (event.value == 0) {
-                        data.is_playing = false;
-                    }
-                }
-                if (event.code == KEY_Y) {
-                    if (event.value == 1) {
-                        data.frequency  = 440.0f; // A
-                        data.is_playing = true;
-                    } else if (event.value == 0) {
-                        data.is_playing = false;
-                    }
-                }
-                if (event.code == KEY_7) {
-                    if (event.value == 1) {
-                        data.frequency  = 466.16f; // A#
-                        data.is_playing = true;
-                    } else if (event.value == 0) {
-                        data.is_playing = false;
-                    }
-                }
-                if (event.code == KEY_U) {
-                    if (event.value == 1) {
-                        data.frequency  = 493.88f; // B
-                        data.is_playing = true;
-                    } else if (event.value == 0) {
-                        data.is_playing = false;
-                    }
-                }
-                if (event.code == KEY_0) {
-                    if (event.value == 1) {
-                        data.is_playing = false;
-                    }
-                }
-                if (event.code == KEY_Z) {
-                    if (event.value == 1) {
-                        playing = false;
-                    }
-                }
+                else if (event.code == KEY_X) data.waveform = 0;
+                else if (event.code == KEY_C) data.waveform = 1;
+                else if (event.code == KEY_V) data.waveform = 2;
+                else if (event.code == KEY_B) data.waveform = 3;
+
             }
         }
 
